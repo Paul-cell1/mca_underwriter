@@ -121,6 +121,16 @@ MCA_RULES = [
     ("SBA Loan", ["SBA EIDL", "PAYMENT SBA", "SBA LOAN"]),
     ("AmEx Business Financing", ["AMEX EPAYMENT", "AMEX BUSINESS", "AMERICAN EXPRESS BUSINESS"]),
 
+
+    ("JPM Advance", ["JPM ADVANCE", "JPMADVANCE"]),
+    ("Insight Capital", ["INSIGHT CAPITAL", "INSIGHTCAPITAL"]),
+    ("Seamless Funding", ["SEAMLESS FUNDING", "SEAMLESSFUNDING"]),
+    ("NAV Kapital", ["NAV KAPITAL", "NAV KAPITAL LLC", "NAVKAPITAL"]),
+    ("UFCE Funding", ["UFCE", "UFCE/ 8449090040", "8449090040"]),
+    ("FDM001", ["FDM001"]),
+    ("Small Business Advance", ["SMALL BUSINESS A", "SMALL BUSINESS ADV", "SMALLBUSINESSA"]),
+    ("Headway Capital", ["HEADWAYCAPITAL", "HEADWAY CAPITAL", "HWCRCVBLS23", "HEADWAY"]),
+
     # ===== Generic fallback - keep last because it is broad =====
     ("General Funding / Capital", [
         "MERCHANT CASH", "ACH FUNDING", "DAILY REMITTANCE", "BUSINESS LOAN",
@@ -744,19 +754,65 @@ def detect_mca_funder(desc: str) -> str | None:
 
 
 def canonical_funder_key(desc: str) -> str:
-    """Normalize descriptions so recurring debits group together."""
-    norm = normalize_description(desc)
-    funder = detect_mca_funder(norm)
+    """Normalize descriptions so recurring debit positions group together.
+
+    This version is intentionally more aggressive for MCA underwriting. It removes
+    ACH plumbing words, IDs, trace numbers, class codes, dates, and amount noise so
+    descriptors like "Withdrawal ACH JPM ADVANCE TYPE: ONLINE PMT ID: 1016207445 CCD"
+    all collapse into "JPM ADVANCE".
+    """
+    raw = normalize_description(desc)
+
+    funder = detect_mca_funder(raw)
     if funder:
         return funder
-    # Remove noisy IDs, dates, trace numbers, account tails, and standalone large numbers.
-    norm = re.sub(r"\b(?:W|NC|COP|BCI|RPP|TRACE|ID|CKF|G)[A-Z0-9-]*\b", " ", norm)
-    norm = re.sub(r"\b\d{3,}\b", " ", norm)
-    norm = re.sub(r"\bON\s+\d{1,2}[/-]\d{1,2}\b", " ", norm)
-    norm = re.sub(r"\s+", " ", norm).strip()
-    # Keep the first meaningful words, not the whole memo.
-    words = [w for w in norm.split() if w not in {"ACH", "ACHPMT", "ACHPAYMENT", "PAYMENT", "DEBIT", "DR", "ADV", "LOAN", "PYMT"}]
-    return " ".join(words[:4]) if words else norm[:40]
+
+    text = raw
+
+    noise_phrases = [
+        "WITHDRAWAL ACH", "EXTERNAL WITHDRAWAL", "DESCRIPTIVE WITHDRAWAL",
+        "ACH WITHDRAWAL", "ACH DEBIT", "ACH PAYMENT", "ACH PMT", "ACHPAYMENT",
+        "TYPE ONLINE PMT", "TYPE ACH PMT", "TYPE RETRY PYMT", "TYPE DEBIT",
+        "TYPE PAYMENT", "TYPE WEB PAY", "TYPE EFT DEBIT", "ENTRY CLASS CODE",
+        "CLASS CODE", "CCD", "WEB", "PPD", "CTX", "RPP", "TRACE", "TRACER",
+        "ONLINE PMT", "RETRY PYMT", "ACH", "PMT", "PYMT", "PAYMENT", "DEBIT",
+        "WITHDRAWAL", "TYPE", "ID", "CO ID", "INDN", "DES",
+    ]
+    for phrase in noise_phrases:
+        text = text.replace(phrase, " ")
+
+    text = re.sub(r"\b[A-Z]*\d{4,}[A-Z0-9-]*\b", " ", text)
+    text = re.sub(r"\b\d{3,}\b", " ", text)
+    text = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", " ", text)
+    text = re.sub(r"[^A-Z0-9 &./-]+", " ", text)
+
+    # Preserve common lender phrases that include generic words.
+    special_patterns = [
+        ("JPM ADVANCE", ["JPM", "ADVANCE"]),
+        ("INSIGHT CAPITAL", ["INSIGHT", "CAPITAL"]),
+        ("SEAMLESS FUNDING", ["SEAMLESS", "FUNDING"]),
+        ("NAV KAPITAL", ["NAV", "KAPITAL"]),
+        ("SMALL BUSINESS ADVANCE", ["SMALL", "BUSINESS"]),
+        ("HEADWAY CAPITAL", ["HEADWAY"]),
+        ("UFCE FUNDING", ["UFCE"]),
+        ("FDM001", ["FDM"]),
+    ]
+    for name, required in special_patterns:
+        if all(part in raw for part in required) or all(part in text for part in required):
+            return name
+
+    stop_words = {
+        "THE", "AND", "INC", "LLC", "LTD", "CO", "COMPANY", "CORP", "CORPORATION",
+        "BANK", "NA", "ONLINE", "WEB", "PORTAL", "BILL", "BILLING", "BATCH",
+        "BUSINESS", "SMALL", "ACH", "PMT", "PYMT", "PAYMENT", "DEBIT", "TYPE",
+        "ID", "CODE", "ENTRY", "CLASS"
+    }
+    words = [w for w in text.split() if w not in stop_words and len(w) > 1]
+
+    if not words:
+        return raw[:50]
+
+    return " ".join(words[:4])
 
 
 def is_revenue(desc: str, amount: float) -> bool:
@@ -991,84 +1047,128 @@ def classify_position_category(desc: str) -> str:
 
 
 def position_score_for_group(descs: pd.Series, amounts: pd.Series, dates: pd.Series) -> tuple[int, str, str]:
-    """Find recurring positions/obligations, not only MCA.
+    """Find recurring MCA/funding positions and other obligations.
 
-    A position is any repeated debit obligation that an underwriter should see:
-    MCA, loan, lease, payroll, processing, insurance, utilities, recurring vendor,
-    transfers/owner draws, or other repeated cash-flow drains.
+    This engine does not require an exact lender match. It scores:
+    repeated debit count, daily/weekly cadence, fixed amount, ACH/CCD/RPP language,
+    funding-style company names, and known lender names.
     """
     desc_list = descs.astype(str).tolist()
-    text = normalize_description(" ".join(desc_list[:30]))
+    raw_text = normalize_description(" ".join(desc_list[:40]))
     count = int(len(amounts))
     abs_amounts = amounts.abs().astype(float)
     avg_amount = float(abs_amounts.mean()) if count else 0.0
     std_dev = float(abs_amounts.std(ddof=0)) if count else 0.0
     variation = (std_dev / avg_amount) if avg_amount > 0 else 999.0
     freq = infer_frequency(dates)
-    category = classify_position_category(text)
 
-    has_payment_language = any(k in text for k in [
-        "ACH", "DEBIT", "WITHDRAWAL", "PAYMENT", "PMT", "PYMT", "BILL", "LOAN", "LEASE", "REMIT", "SERVICING"
-    ])
-    known_mca = detect_mca_funder(text) is not None
+    known_name = detect_mca_funder(raw_text)
+    known_mca = known_name is not None
+
+    funding_words = [
+        "MCA", "ADVANCE", "CAPITAL", "FUNDING", "FUNDER", "FINANCING", "FINANCE",
+        "RECEIVABLE", "RECEIVABLES", "RCVBLS", "HOLDINGS", "KAPITAL", "SERVICING",
+        "MERCHANT", "REMIT", "REMITTANCE", "DAILY", "WORKING CAPITAL", "BUSINESS FUNDING",
+        "JPM ADVANCE", "INSIGHT CAPITAL", "SEAMLESS FUNDING", "NAV KAPITAL", "UFCE", "FDM"
+    ]
+    ach_words = [
+        "ACH", "CCD", "RPP", "DEBIT", "WITHDRAWAL", "PAYMENT", "PMT", "PYMT",
+        "ONLINE PMT", "DAILY", "WEEKLY", "RETRY PYMT", "WEB PAY"
+    ]
+    operating_words = [
+        "PAYROLL", "ADP", "PAYCHEX", "VENSURE", "GUSTO", "ZELLE", "VENMO", "CASHAPP",
+        "CASH APP", "ONLINE TRANSFER", "MOBILE TRANSFER", "INTERNET TRANSFER",
+        "TRANSFER TO", "WIRE FEE", "WIRE OUT", "CHECKCARD", "DEBIT CARD", "POS",
+        "PURCHASE", "CARD", "LOWES", "HOME DEPOT", "AMAZON", "APPLE.COM", "SPOTIFY",
+        "NETFLIX", "GOOGLE", "FACEBK", "COMCAST", "ATT", "INSURANCE", "ALFA MUTUAL",
+        "NORTHWESTERN", "PROG FREEDOM", "TRACTOR SUPPLY", "AGRICREDIT", "GM FINANCIAL",
+        "TD AUTO FINANCE", "SHEFFIELD", "INTUIT TRAN FEE", "TRAN FEE", "MERCHANT SERV",
+        "CPS MERCHANT", "INTUIT "
+    ]
+
+    has_funding_word = any(w in raw_text for w in funding_words)
+    has_ach_word = any(w in raw_text for w in ach_words)
+    has_operating_word = any(w in raw_text for w in operating_words)
+
+    category = classify_position_category(raw_text)
+    if known_mca or (has_funding_word and has_ach_word):
+        category = "MCA / Funding"
+    elif "LOAN" in raw_text or "FINANCING" in raw_text:
+        category = "Term Loan / Credit"
 
     score = 0
     reasons = []
 
-    if any(w in text for w in POSITION_EXCLUDE_WORDS):
-        score -= 50
+    if any(w in raw_text for w in POSITION_EXCLUDE_WORDS):
+        score -= 60
         reasons.append("reversal/refund/rejected/balance line")
 
-    if category != "Recurring Debit / Review":
-        score += 25
-        reasons.append(f"category={category}")
     if known_mca:
-        score += 35
-        reasons.append("known MCA/funding lender")
-    if has_payment_language:
+        score += 45
+        reasons.append(f"known MCA/funding lender: {known_name}")
+
+    if has_funding_word:
+        score += 25
+        reasons.append("funding-style descriptor")
+
+    if has_ach_word:
         score += 15
-        reasons.append("payment/debit language")
+        reasons.append("ACH/debit/payment language")
 
     if count >= 15:
-        score += 30
-        reasons.append("heavy repetition")
+        score += 35
+        reasons.append("heavy repeated debits")
+    elif count >= 8:
+        score += 28
+        reasons.append("strong recurring debits")
     elif count >= 5:
-        score += 22
+        score += 20
         reasons.append("recurring debits")
     elif count >= 3:
-        score += 14
+        score += 12
         reasons.append("some repetition")
     elif count == 2:
-        score += 6
+        score += 5
         reasons.append("two occurrences")
 
     if "daily" in str(freq).lower():
-        score += 22
-        reasons.append("daily pattern")
+        score += 25
+        reasons.append("daily/business-day pattern")
     elif str(freq).lower() in {"weekly", "biweekly", "monthly"}:
         score += 14
         reasons.append(f"{freq} pattern")
 
     if count >= 2 and avg_amount > 0:
-        if variation <= 0.08:
-            score += 18
+        if variation <= 0.03:
+            score += 25
             reasons.append("fixed amount")
+        elif variation <= 0.08:
+            score += 18
+            reasons.append("near-fixed amount")
         elif variation <= 0.20:
-            score += 10
+            score += 8
             reasons.append("mostly fixed amount")
 
-    # Unknown vendors need more evidence than known categories.
-    if category == "Recurring Debit / Review" and count < 3:
-        score = min(score, 35)
-        reasons.append("capped: unknown with less than 3 hits")
-    if category == "Recurring Debit / Review" and not has_payment_language and count < 5:
-        score = min(score, 40)
-        reasons.append("capped: unknown without payment language")
+    if count >= 5 and "daily" in str(freq).lower() and variation <= 0.10 and has_ach_word:
+        score += 25
+        reasons.append("hidden position pattern: daily fixed ACH")
 
-    # One-off or noisy card purchases are not positions unless they repeat strongly.
-    if any(w in text for w in ["POINT OF SALE", "CHECKCARD", "CARD #", "PURCHASE"]) and count < 5:
-        score -= 20
-        reasons.append("card/POS purchase needs stronger recurrence")
+    if has_operating_word and not known_mca and not has_funding_word:
+        score -= 45
+        reasons.append("operational/vendor/payroll/card context")
+
+    if any(w in raw_text for w in ["DEBIT CARD", "CHECKCARD", "POINT OF SALE", "POS", "PURCHASE"]) and count < 10:
+        score -= 30
+        reasons.append("card/POS activity")
+
+    if avg_amount > 15000 and count < 3:
+        score -= 25
+        reasons.append("large one-off debit")
+
+    if not known_mca and not has_funding_word and category == "Recurring Debit / Review":
+        if not (count >= 5 and "daily" in str(freq).lower() and variation <= 0.10 and has_ach_word):
+            score = min(score, 50)
+            reasons.append("capped: recurring but no funding language")
 
     score = max(0, min(100, int(score)))
     return score, ", ".join(dict.fromkeys([r for r in reasons if r])), category
@@ -1126,7 +1226,10 @@ def build_positions(tx: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     tx["position_category"] = tx["position_key"].map(key_to_category)
     tx["mca_score"] = tx["position_key"].map(key_to_score).fillna(0).astype(int)
     tx["is_mca_debit"] = (tx["amount"] < 0) & tx["mca_funder"].notna()
-    positions = positions.sort_values(["Est Monthly", "Total Debited"], ascending=False).drop(columns=["position_key"])
+    positions = positions.sort_values(
+        by=["# Debits", "Confidence Score", "Est Monthly"],
+        ascending=[False, False, False]
+    ).drop(columns=["position_key"])
     return positions, tx.drop(columns=["position_key"], errors="ignore")
 
 def build_report(tx: pd.DataFrame, statement: dict, daily_balances: pd.DataFrame):
@@ -1267,13 +1370,21 @@ def calculate_underwriting_risk(tx: pd.DataFrame, summary: dict, funders: pd.Dat
         findings.append(f"Too many negative balance days ({int(negative_days)}).")
         score += 20
 
-    # Stacking
-    active_positions = int(len(funders)) if funders is not None else 0
+    # Funding stacking should count true/likely funding positions, not every recurring bill/vendor.
+    active_positions = 0
+    if funders is not None and not funders.empty:
+        if "Position Category" in funders.columns:
+            funding_mask = funders["Position Category"].astype(str).isin(["MCA / Funding", "Term Loan / Credit", "Equipment Lease"])
+            if "Confidence Score" in funders.columns:
+                funding_mask = funding_mask & (pd.to_numeric(funders["Confidence Score"], errors="coerce").fillna(0) >= 60)
+            active_positions = int(funding_mask.sum())
+        else:
+            active_positions = int(len(funders))
     if active_positions >= UNDERWRITING_RULES["max_stacked_positions"]:
-        findings.append(f"Heavy MCA/funding stacking detected ({active_positions} positions).")
+        findings.append(f"Heavy funding/loan stacking detected ({active_positions} likely debt positions).")
         score += 30
     elif active_positions >= 2:
-        findings.append(f"Multiple active funding positions detected ({active_positions}).")
+        findings.append(f"Multiple funding/loan positions detected ({active_positions}).")
         score += 12
 
     # MCA load
@@ -1638,12 +1749,54 @@ def read_pdf(uploaded_file) -> tuple[pd.DataFrame, dict, pd.DataFrame, str]:
 
 
 # -----------------------------
-# Streamlit UI
+# Streamlit UI - focused office version
 # -----------------------------
 
-st.set_page_config(page_title="MCA Underwriting Analyzer", layout="wide")
-st.title("MCA Underwriting Analyzer")
-st.caption("PDF-first MCA underwriting snapshot with position engine, recurring debit detection, and optional OCR fallback.")
+
+def filter_positions_for_underwriting(positions: pd.DataFrame, min_confidence: int, show_operational: bool) -> pd.DataFrame:
+    """Underwriting-focused position filter.
+
+    Always keeps likely debt/funding positions, uses confidence for everything else,
+    hides operational noise by default, and sorts by highest # Debits first.
+    """
+    positions_view = filter_positions_for_underwriting(positions, min_confidence, show_operational)
+    if positions_view.empty:
+        return positions_view
+
+    debt_category_mask = (
+        positions_view["Position Category"]
+        .astype(str)
+        .str.contains("MCA|Funding|Loan|Credit|Advance|Kapital|Capital", case=False, na=False)
+    )
+
+    confidence_mask = (
+        pd.to_numeric(positions_view["Confidence Score"], errors="coerce")
+        .fillna(0)
+        >= min_confidence
+    )
+
+    positions_view = positions_view[debt_category_mask | confidence_mask]
+
+    if not show_operational:
+        operational_mask = (
+            positions_view["Position Category"]
+            .astype(str)
+            .str.contains(
+                "Operational|Payroll|Marketing|Insurance|Utilities|Telecom|Rent|Tax|Vendor|Supplier|Transfer|Owner Draw|Processor|Fees",
+                case=False,
+                na=False,
+            )
+        )
+        positions_view = positions_view[~operational_mask]
+
+    return positions_view.sort_values(
+        by=["# Debits", "Confidence Score", "Est Monthly"],
+        ascending=[False, False, False],
+    )
+
+st.set_page_config(page_title="MCA Position Finder", layout="wide")
+st.title("MCA Position Finder")
+st.caption("Focused underwriting view: Risk Findings + Detected Recurring Positions.")
 
 uploaded_files = st.file_uploader(
     "Upload PDF bank statements, CSV, or Excel",
@@ -1652,9 +1805,19 @@ uploaded_files = st.file_uploader(
 )
 
 with st.sidebar:
-    st.header("Parser notes")
-    st.write("For best results, upload original digital PDFs. Scanned PDFs need Tesseract OCR installed locally.")
-    st.write("MCA detection uses known keywords plus recurring debit scoring. Add funder names to MCA_RULES near the top of the file.")
+    st.header("View settings")
+    min_confidence = st.slider("Minimum position confidence", 0, 100, 0, 5)
+    show_operational = st.checkbox("Show operational recurring payments", value=False)
+    show_transactions = st.checkbox("Show underlying position transactions", value=False)
+    st.divider()
+    st.caption("Default view hides normal operating noise so underwriters can focus on debt/funding positions.")
+
+FUNDING_CATEGORIES = ["MCA / Funding", "Term Loan / Credit", "Equipment Lease", "Recurring Debit / Review"]
+OPERATIONAL_CATEGORIES = [
+    "Payroll / HR", "Merchant Processor / Fees", "Marketing / Advertising", "Insurance",
+    "Utilities / Telecom", "Rent / Real Estate", "Tax / Government",
+    "Internal Transfer / Owner Draw", "Vendor / Supplier",
+]
 
 if uploaded_files:
     frames, daily_frames, statements = [], [], []
@@ -1680,75 +1843,88 @@ if uploaded_files:
         for s in statements:
             combined_statement.update(s)
         all_daily_balances = pd.concat(daily_frames, ignore_index=True) if daily_frames else pd.DataFrame()
-        summary, funders, month_deposits, red_flags, classified_tx = build_report(tx, combined_statement, all_daily_balances)
+        summary, positions, month_deposits, red_flags, classified_tx = build_report(tx, combined_statement, all_daily_balances)
+        risk = calculate_underwriting_risk(classified_tx, summary, positions, all_daily_balances)
 
-        st.subheader("Underwriting Summary")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Avg Monthly Deposits", money(summary["Avg Monthly Deposits"]))
-        c2.metric("Avg Daily Balance", money(summary["Avg Daily Balance"]))
-        c3.metric("Min Balance", money(summary["Min Balance"]))
-        c4.metric("Negative Days", str(summary["Negative Days"]))
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("Detected Positions", str(summary["Detected Positions"]))
-        c6.metric("Est. Monthly Positions", money(summary["Estimated Monthly Positions"]))
-        c7.metric("Debt-to-Revenue", pct(summary["Debt-to-Revenue"]))
-        c8.metric("Transactions Parsed", str(summary["Transactions Parsed"]))
+        # Filter positions for office workflow.
+        display_positions = positions.copy()
+        if not display_positions.empty:
+            display_positions["Confidence Score"] = pd.to_numeric(display_positions["Confidence Score"], errors="coerce").fillna(0).astype(int)
+            display_positions = display_positions[display_positions["Confidence Score"] >= min_confidence]
+            if not show_operational:
+                display_positions = display_positions[display_positions["Position Category"].isin(FUNDING_CATEGORIES)]
 
-        risk = calculate_underwriting_risk(classified_tx, summary, funders, all_daily_balances)
-        st.subheader("Underwriting Risk Grade")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Risk Grade", risk["risk_grade"])
-        r2.metric("Risk Score", risk["risk_score"])
-        r3.metric("NSF Count", risk["nsf_count"])
-        r4.metric("Transfer Dependency", pct(risk["transfer_dependency"]))
+            priority = {
+                "MCA / Funding": 0,
+                "Term Loan / Credit": 1,
+                "Equipment Lease": 2,
+                "Recurring Debit / Review": 3,
+                "Merchant Processor / Fees": 4,
+                "Payroll / HR": 5,
+                "Internal Transfer / Owner Draw": 6,
+            }
+            display_positions["_priority"] = display_positions["Position Category"].map(priority).fillna(9)
+            display_positions = display_positions.sort_values(
+                ["_priority", "Confidence Score", "Est Monthly", "# Debits"],
+                ascending=[True, False, False, False],
+            ).drop(columns=["_priority"], errors="ignore")
 
+        # Top metrics only.
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Risk Grade", risk["risk_grade"])
+        m2.metric("Risk Score", risk["risk_score"])
+        m3.metric("Funding Positions", str(summary.get("Existing Funders", 0)))
+        m4.metric("MCA Debt-to-Revenue", pct(summary.get("Debt-to-Revenue", 0)))
+
+        # Risk Findings first.
         st.subheader("Risk Findings")
-        for item in risk["findings"]:
-            if risk["risk_score"] >= 60:
-                st.error(item)
-            elif risk["risk_score"] >= 30:
-                st.warning(item)
-            else:
-                st.info(item)
-
-        st.subheader("Detected Recurring Positions")
-        if funders.empty:
-            st.info("No recurring positions detected from current rules.")
-        else:
-            st.dataframe(funders, use_container_width=True)
-
-        st.subheader("Monthly Deposits")
-        st.dataframe(month_deposits, use_container_width=True)
-
-        st.subheader("Statement Summary Found")
-        st.json({k: (money(v) if isinstance(v, float) else v) for k, v in combined_statement.items()})
-
-        st.subheader("Red Flags")
+        if risk["findings"]:
+            for item in risk["findings"]:
+                if risk["risk_score"] >= 60:
+                    st.error(item)
+                elif risk["risk_score"] >= 30:
+                    st.warning(item)
+                else:
+                    st.info(item)
         for flag in red_flags:
-            st.write(f"- {flag}")
+            if flag not in risk["findings"] and "No major" not in flag:
+                st.warning(flag)
 
-        st.subheader("Detected Position Transactions")
-        mca_cols = ["file_name", "date", "mca_funder", "position_category", "description", "amount", "source", "source_line"]
-        st.dataframe(classified_tx[classified_tx["is_mca_debit"]][[c for c in mca_cols if c in classified_tx.columns]], use_container_width=True)
+        # Detected Recurring Positions second.
+        st.subheader("Detected Recurring Positions")
+        if display_positions.empty:
+            st.info("No positions matched the current confidence/category filters. Lower the confidence slider or enable operational recurring payments.")
+        else:
+            cols = [
+                "Position", "Position Category", "Confidence", "Confidence Score", "Frequency",
+                "Avg Debit", "Est Monthly", "# Debits", "Total Debited", "First Date", "Last Date", "Why Flagged"
+            ]
+            cols = [c for c in cols if c in display_positions.columns]
+            st.dataframe(display_positions[cols], use_container_width=True, hide_index=True)
 
-        st.subheader("All Parsed Transactions")
-        display_cols = [c for c in ["file_name", "date", "section", "description", "amount", "mca_funder", "position_category", "mca_score", "is_mca_debit", "is_revenue", "source", "source_line"] if c in classified_tx.columns]
-        st.dataframe(classified_tx[display_cols], use_container_width=True)
-
-        # Downloadable review files help you tune the model without changing code every time.
-        if not funders.empty:
             st.download_button(
                 "Download detected positions",
-                funders.to_csv(index=False).encode("utf-8"),
+                display_positions.to_csv(index=False).encode("utf-8"),
                 "detected_positions.csv",
                 "text/csv",
             )
 
-        st.download_button(
-            "Download classified transactions",
-            classified_tx.to_csv(index=False).encode("utf-8"),
-            "classified_transactions.csv",
-            "text/csv",
-        )
+        # Optional drill-down only when wanted.
+        if show_transactions:
+            st.subheader("Underlying Position Transactions")
+            tx_cols = ["file_name", "date", "mca_funder", "position_category", "description", "amount", "mca_score", "source"]
+            tx_cols = [c for c in tx_cols if c in classified_tx.columns]
+            position_tx = classified_tx[classified_tx["is_mca_debit"]].copy()
+            if not show_operational and "position_category" in position_tx.columns:
+                position_tx = position_tx[position_tx["position_category"].isin(FUNDING_CATEGORIES)]
+            if "mca_score" in position_tx.columns:
+                position_tx = position_tx[pd.to_numeric(position_tx["mca_score"], errors="coerce").fillna(0) >= min_confidence]
+            st.dataframe(position_tx[tx_cols], use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download classified transactions",
+                classified_tx.to_csv(index=False).encode("utf-8"),
+                "classified_transactions.csv",
+                "text/csv",
+            )
 else:
     st.info("Upload one or more bank statements to begin.")
