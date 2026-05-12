@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+python-dateutil
+openpyxl
+pdfplumber
+pymupdf
+Pillow
